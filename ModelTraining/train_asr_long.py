@@ -1,4 +1,4 @@
-# scripts/train_asr_long.py
+
 import os, math, time, random
 import numpy as np
 import torch, torch.nn as nn, torch.optim as optim
@@ -11,7 +11,6 @@ from datasets import load_dataset, Audio
 from tiny_conformer_ctc import TinyConformerCTC
 from spec_augment import spec_augment
 
-# ===================== knobs you can edit =====================
 EPOCHS            = 75           # total passes
 STEPS_PER_EPOCH   = 2500         # minibatches per epoch
 BATCH_SIZE        = 4
@@ -24,16 +23,14 @@ USE_SPEC_AUG      = True
 SPM_PATH          = os.path.join("models", "bpe2k.model")  # or "bpe1k.model"
 SR                = 16000
 N_MELS            = 80
-# =============================================================
+
 
 os.makedirs("models", exist_ok=True)
 
-# ----- tokenizer / vocab / blank -----
 spm = SentencePieceProcessor(model_file=SPM_PATH)
 VOCAB = spm.get_piece_size()
 BLANK = VOCAB  # CTC blank id is vocab size
 
-# ----- feature pipeline -----
 mel = torchaudio.transforms.MelSpectrogram(
     sample_rate=SR, n_fft=640, hop_length=160, win_length=320,
     n_mels=N_MELS, f_min=20, f_max=7600, power=1.0
@@ -44,13 +41,13 @@ def pick_device():
     # NVIDIA CUDA
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # Apple Silicon (M1/M2/M3)
+    # Apple 
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps")
-    # Intel GPUs (oneAPI / XPU builds)
+    # Intel 
     if hasattr(torch, "xpu") and callable(getattr(torch.xpu, "is_available", None)) and torch.xpu.is_available():
         return torch.device("xpu")
-    # Windows AMD/Intel via DirectML
+    # Windows
     try:
         import torch_directml
         return torch_directml.device()  # special device object
@@ -62,7 +59,7 @@ def pick_device():
 
 
 def cmvn_timewise(x: torch.Tensor, n_mels: int = N_MELS) -> torch.Tensor:
-    """Per-channel CMVN across time, robust to layout. Returns [n_mels, T]."""
+
     if x.dim() != 2:
         raise RuntimeError(f"Expected 2D mel, got {tuple(x.shape)}")
     if x.shape[0] == n_mels:             # [n_mels, T]
@@ -74,7 +71,7 @@ def cmvn_timewise(x: torch.Tensor, n_mels: int = N_MELS) -> torch.Tensor:
     raise RuntimeError(f"Unexpected mel shape {tuple(x.shape)}; cannot find n_mels={n_mels} on any axis")
 
 def to_logmel_tensor(wav_np: np.ndarray) -> torch.Tensor:
-    """Compute log-mel robustly and return [n_mels, T] float32 with CMVN."""
+
     with torch.no_grad():
         x = mel(torch.from_numpy(wav_np.astype("float32", copy=False)).unsqueeze(0)) + 1e-6
         x = x.squeeze(0)  # [n_mels,T] or [T,n_mels]
@@ -82,7 +79,6 @@ def to_logmel_tensor(wav_np: np.ndarray) -> torch.Tensor:
         x = cmvn_timewise(x, n_mels=N_MELS)  # -> [n_mels, T]
         return x.contiguous()
 
-# ----- dataset helpers -----
 def _iter_hf_local_splits(splits):
     """Yield (wav_numpy, text) from HF dataset **only when local files exist**."""
     for split in splits:
@@ -109,7 +105,6 @@ def _iter_hf_local_splits(splits):
             yield wav, txt
 
 def _iter_torchaudio_train():
-    """Yield (wav_numpy, text) from torchaudio train-clean-* (downloads if needed)."""
     roots = "."
     # order doesn't matter; you can shuffle downstream
     ds1 = torchaudio.datasets.LIBRISPEECH(roots, url="train-clean-100", download=True)
@@ -171,7 +166,6 @@ def collate(batch):
     # int64 lengths for CTC
     return out, torch.cat(tgts), torch.tensor(in_lens, dtype=torch.int64), torch.tensor(tgt_lens, dtype=torch.int64)
 
-# ----- CER + greedy decode for validation -----
 def cer(ref: str, hyp: str) -> float:
     r, h = list(ref), list(hyp)
     R, H = len(r), len(h)
@@ -193,7 +187,6 @@ def greedy_ids_from_logp_np(logp_np, blank_id=BLANK):
 
 @torch.no_grad()
 def validate(model: nn.Module, n_samples: int = VALID_SAMPLES) -> float:
-    """Return avg CER on LibriSpeech validation split, robustly (fast greedy)."""
     model.eval()
     device = next(model.parameters()).device
 
@@ -201,7 +194,7 @@ def validate(model: nn.Module, n_samples: int = VALID_SAMPLES) -> float:
     total = 0.0
     start = time.time()
 
-    # 1) Try HF local files first
+  
     ds = load_dataset("openslr/librispeech_asr", "clean", split="validation", streaming=False)
     ds = ds.cast_column("audio", Audio(decode=False)).with_format("python")
 
@@ -231,7 +224,6 @@ def validate(model: nn.Module, n_samples: int = VALID_SAMPLES) -> float:
         if scored >= n_samples or (time.time() - start) > VAL_TIME_BUDGET_S:
             break
 
-    # 2) Fallback to torchaudio dataset if nothing scored
     if scored == 0:
         print("[val] HF local paths unusable - falling back to torchaudio test-clean for validation stubs")
         td = torchaudio.datasets.LIBRISPEECH(".", url="test-clean", download=True)
@@ -254,14 +246,12 @@ def validate(model: nn.Module, n_samples: int = VALID_SAMPLES) -> float:
     print(f"[val] scored {scored} samples")
     return total / scored
 
-# ----- helpers -----
 def ensure_log_probs(x: torch.Tensor) -> torch.Tensor:
     """Ensure [B,T,V] are log-probs before feeding CTC."""
     if torch.any(x > 0):  # crude check; logits usually include positives
         return torch.log_softmax(x, dim=-1)
     return x
 
-# ----- training -----
 def main():
     device = pick_device()
     print("Using device:", device)
@@ -275,7 +265,6 @@ def main():
     opt = optim.AdamW(model.parameters(), lr=BASE_LR, betas=(0.9, 0.98), weight_decay=1e-2)
     total_effective_steps = (EPOCHS * STEPS_PER_EPOCH) // max(1, ACCUM)
 
-    # Warmup + Cosine
     def lr_lambda(step):
         if step < WARMUP_STEPS:
             return float(step + 1) / max(1, WARMUP_STEPS)
@@ -302,23 +291,20 @@ def main():
             logp = model(feat)                               # [B,T_out,V]
             logp = ensure_log_probs(logp)
 
-            # --- SCALE input lengths from mel frames (T_in) to model frames (T_out) ---
+           
             B, T_out, V = logp.shape
             T_in = feat.shape[-1]
-            # proportional scaling, then clamp so it's never > T_out
+
             in_l_scaled = (in_l * T_out // T_in).clamp(max=T_out).to(torch.int64)
 
-            # (Optional safety) if any target is longer than input, cap it to input
-            # (this should rarely/never trigger on LibriSpeech with BPE)
             y_l_capped = torch.minimum(y_l, in_l_scaled)
 
-            # CTC expects: [T,B,V], int64 lengths
+
             loss = ctc(logp.permute(1, 0, 2), y.to(device), in_l_scaled, y_l_capped) / ACCUM
 
             loss.backward()
 
             if global_step % ACCUM == 0:
-                # gradient norm (for debugging)
                 with torch.no_grad():
                     total_norm_sq = 0.0
                     for p in model.parameters():
@@ -343,12 +329,12 @@ def main():
         print(f"[train] seen {trained_items} items this epoch")
         if trained_items == 0:
             print("[WARN] No training audio seen. Falling back to torchaudio likely failed - check internet or dataset availability.")
-        # save per-epoch checkpoint
+       
         ep_path = f"models/asr_tiny_fp32_ep{epoch}.pt"
         torch.save(model.state_dict(), ep_path)
         print(f"? Saved {ep_path}")
 
-        # validate & keep best
+
         val_cer = validate(model, n_samples=VALID_SAMPLES)
         print(f"[val] CER={val_cer:.3f}   (best so far: {best_cer:.3f})")
         if val_cer < best_cer:
@@ -357,9 +343,10 @@ def main():
             torch.save(model.state_dict(), best_path)
             print(f"? Saved new best: {best_path}")
 
-    # final save (last weights)
+
     torch.save(model.state_dict(), "models/asr_tiny_fp32.pt")
     print("Saved FP32 model to models/asr_tiny_fp32.pt")
 
 if __name__ == "__main__":
     main()
+
