@@ -1,4 +1,4 @@
-# scripts/trainWithMetrics.py
+
 import os, math, time, random, json
 import numpy as np
 import torch, torch.nn as nn, torch.optim as optim
@@ -13,32 +13,27 @@ from string import ascii_lowercase
 from tiny_conformer_ctc import TinyConformerCTC
 from spec_augment import spec_augment
 
-# ===================== knobs you can edit =====================
 EPOCHS            = 75           # total passes
 STEPS_PER_EPOCH   = 2500         # minibatches per epoch
 BATCH_SIZE        = 4
-ACCUM             = 8            # effective batch = BATCH_SIZE*ACCUM
+ACCUM             = 8        
 BASE_LR           = 5e-4
 WARMUP_STEPS      = 1000
 VALID_SAMPLES     = 50
 VAL_TIME_BUDGET_S = 60
 USE_SPEC_AUG      = True
-SPM_PATH          = os.path.join("models", "bpe2k.model")  # or "bpe1k.model"
+SPM_PATH          = os.path.join("models", "bpe2k.model")  
 SR                = 16000
 N_MELS            = 80
 
-# Prefer HuggingFace local LibriSpeech cache, or just use torchaudio?
-USE_HF_LOCAL_LIBRISPEECH = False  # set True if you really want HF and it's fast on your machine
-# =============================================================
+USE_HF_LOCAL_LIBRISPEECH = False  
 
 os.makedirs("models", exist_ok=True)
 
-# ----- tokenizer / vocab / blank -----
 spm = SentencePieceProcessor(model_file=SPM_PATH)
 VOCAB = spm.get_piece_size()
 BLANK = VOCAB  # CTC blank id is vocab size
 
-# ----- feature pipeline -----
 mel = torchaudio.transforms.MelSpectrogram(
     sample_rate=SR, n_fft=640, hop_length=160, win_length=320,
     n_mels=N_MELS, f_min=20, f_max=7600, power=1.0
@@ -49,13 +44,13 @@ def pick_device():
     # NVIDIA CUDA
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # Apple Silicon (M1/M2/M3)
+    # Apple Silicon
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps")
-    # Intel GPUs (oneAPI / XPU builds)
+    # Intel GPUs
     if hasattr(torch, "xpu") and callable(getattr(torch.xpu, "is_available", None)) and torch.xpu.is_available():
         return torch.device("xpu")
-    # Windows AMD/Intel via DirectML
+    # Windows AMD
     try:
         import torch_directml
         return torch_directml.device()  # special device object
@@ -66,20 +61,18 @@ def pick_device():
 
 
 def cmvn_timewise(x: torch.Tensor, n_mels: int = N_MELS) -> torch.Tensor:
-    """Per-channel CMVN across time, robust to layout. Returns [n_mels, T]."""
     if x.dim() != 2:
         raise RuntimeError(f"Expected 2D mel, got {tuple(x.shape)}")
-    if x.shape[0] == n_mels:             # [n_mels, T]
+    if x.shape[0] == n_mels:       
         m = x.mean(dim=1, keepdim=True); s = x.std(dim=1, keepdim=True).clamp_min(1e-5)
         return (x - m) / s
-    if x.shape[1] == n_mels:             # [T, n_mels]
+    if x.shape[1] == n_mels:         
         m = x.mean(dim=0, keepdim=True); s = x.std(dim=0, keepdim=True).clamp_min(1e-5)
         return ((x - m) / s).transpose(0, 1)
     raise RuntimeError(f"Unexpected mel shape {tuple(x.shape)}; cannot find n_mels={n_mels} on any axis")
 
 
 def to_logmel_tensor(wav_np: np.ndarray) -> torch.Tensor:
-    """Compute log-mel robustly and return [n_mels, T] float32 with CMVN."""
     with torch.no_grad():
         x = mel(torch.from_numpy(wav_np.astype("float32", copy=False)).unsqueeze(0)) + 1e-6
         x = x.squeeze(0)  # [n_mels,T] or [T,n_mels]
@@ -87,9 +80,7 @@ def to_logmel_tensor(wav_np: np.ndarray) -> torch.Tensor:
         x = cmvn_timewise(x, n_mels=N_MELS)  # -> [n_mels, T]
         return x.contiguous()
 
-# ----- dataset helpers -----
 def _iter_hf_local_splits(splits):
-    """Yield (wav_numpy, text) from HF dataset **only when local files exist**."""
     for split in splits:
         ds = load_dataset("openslr/librispeech_asr", "clean", split=split, streaming=False)
         ds = ds.cast_column("audio", Audio(decode=False)).with_format("python")
@@ -115,7 +106,6 @@ def _iter_hf_local_splits(splits):
 
 
 def _iter_torchaudio_train():
-    """Yield (wav_numpy, text) from torchaudio train-clean-* (downloads if needed)."""
     roots = "."
     ds1 = torchaudio.datasets.LIBRISPEECH(roots, url="train-clean-100", download=True)
     ds2 = torchaudio.datasets.LIBRISPEECH(roots, url="train-clean-360", download=True)
@@ -139,17 +129,14 @@ def _take_n(iterable, n):
 
 class TrainIterable(torch.utils.data.IterableDataset):
     def __init__(self):
-        # If we don't want HF, just go straight to torchaudio
         if not USE_HF_LOCAL_LIBRISPEECH:
             self._mode = "ta"
             print("[TrainIterable] HF disabled -> using torchaudio (train-clean-100/360)")
             return
 
-        # Otherwise, lightly probe HF, but recover fast on errors
         self._mode = "ta"
         try:
             for _ in _take_n(_iter_hf_local_splits(["train"]), 1):
-                # If we can iterate at least one example, assume HF is usable
                 self._mode = "hf"
                 break
             print(f"[TrainIterable] mode = {self._mode}")
@@ -180,7 +167,6 @@ def collate(batch):
         in_lens.append(f.shape[-1])
         tgt_lens.append(int(ids.numel()))
     if len(in_lens) == 0:
-        # Empty batch (shouldn't happen, but be safe)
         return (
             torch.zeros(0, N_MELS, 1),
             torch.tensor([], dtype=torch.int32),
@@ -191,12 +177,9 @@ def collate(batch):
     out = torch.zeros(B, F, T, dtype=torch.float32)
     for i, f in enumerate(feats):
         out[i, :, :f.shape[-1]] = f
-    # int64 lengths for CTC
     return out, torch.cat(tgts), torch.tensor(in_lens, dtype=torch.int64), torch.tensor(tgt_lens, dtype=torch.int64)
 
-# ----- CER + greedy decode + confusion matrix for validation -----
 def cer(ref: str, hyp: str) -> float:
-    """Character error rate between two strings."""
     r, h = list(ref), list(hyp)
     R, H = len(r), len(h)
     dp = np.zeros((R + 1, H + 1), dtype=np.int32)
@@ -221,8 +204,6 @@ def greedy_ids_from_logp_np(logp_np, blank_id=BLANK):
     return ids
 
 
-# --- confusion matrix helpers ---
-# We restrict to lower-case letters + space + apostrophe + "other"
 CONF_CHARS = list(ascii_lowercase + " '")
 CONF_OTHER = "<other>"
 CONF_ALL = CONF_CHARS + [CONF_OTHER]
@@ -233,7 +214,6 @@ def _char_to_idx(c: str) -> int:
 
 
 def update_confusion(ref: str, hyp: str, mat: np.ndarray):
-    """Update character-level confusion matrix using Levenshtein backtrace."""
     r = list(ref); h = list(hyp)
     R, H = len(r), len(h)
     dp = np.zeros((R + 1, H + 1), dtype=np.int32)
@@ -270,12 +250,7 @@ def update_confusion(ref: str, hyp: str, mat: np.ndarray):
 
 @torch.no_grad()
 def validate(model: nn.Module, n_samples: int = VALID_SAMPLES, collect_confusion: bool = True):
-    """
-    Return:
-      avg_cer: mean CER over samples
-      rmse_cer: sqrt(mean(CER^2))
-      confusion: (C,C) matrix over characters (or None)
-    """
+
     model.eval()
     device = next(model.parameters()).device
 
@@ -288,7 +263,6 @@ def validate(model: nn.Module, n_samples: int = VALID_SAMPLES, collect_confusion
     if collect_confusion:
         confusion = np.zeros((len(CONF_ALL), len(CONF_ALL)), dtype=np.int64)
 
-    # ---------- 1) Optional HF validation ----------
     if USE_HF_LOCAL_LIBRISPEECH:
         try:
             ds = load_dataset("openslr/librispeech_asr", "clean", split="validation", streaming=False)
@@ -331,7 +305,6 @@ def validate(model: nn.Module, n_samples: int = VALID_SAMPLES, collect_confusion
         except Exception as e:
             print("[val] HF validation failed, will fall back to torchaudio:", repr(e))
 
-    # ---------- 2) Fallback to torchaudio test-clean ----------
     if scored == 0:
         print("[val] HF local paths unusable or disabled - using torchaudio test-clean for validation")
         td = torchaudio.datasets.LIBRISPEECH(".", url="test-clean", download=True)
@@ -362,14 +335,12 @@ def validate(model: nn.Module, n_samples: int = VALID_SAMPLES, collect_confusion
     rmse_cer = math.sqrt(sum(c * c for c in cer_values) / max(1, len(cer_values)))
     return avg_cer, rmse_cer, confusion
 
-# ----- helpers -----
 def ensure_log_probs(x: torch.Tensor) -> torch.Tensor:
     """Ensure [B,T,V] are log-probs before feeding CTC."""
     if torch.any(x > 0):  # crude check; logits usually include positives
         return torch.log_softmax(x, dim=-1)
     return x
 
-# ----- training -----
 def main():
     device = pick_device()
     print("Using device:", device)
@@ -395,7 +366,6 @@ def main():
     best_cer = float("inf")
     best_char_acc = 0.0
 
-    # ---- metric histories (per epoch) ----
     train_losses = []
     val_cers = []
     val_char_accs = []
@@ -418,20 +388,19 @@ def main():
             logp = model(feat)                               # [B,T_out,V]
             logp = ensure_log_probs(logp)
 
-            # --- SCALE input lengths from mel frames (T_in) to model frames (T_out) ---
+         
             B, T_out, V = logp.shape
             T_in = feat.shape[-1]
             in_l_scaled = (in_l * T_out // T_in).clamp(max=T_out).to(torch.int64)
             # cap target lengths to input lengths (safety)
             y_l_capped = torch.minimum(y_l, in_l_scaled)
 
-            # CTC expects: [T,B,V], int64 lengths
+
             loss = ctc(logp.permute(1, 0, 2), y.to(device), in_l_scaled, y_l_capped) / ACCUM
 
             loss.backward()
 
             if global_step % ACCUM == 0:
-                # gradient norm (for debugging)
                 with torch.no_grad():
                     total_norm_sq = 0.0
                     for p in model.parameters():
@@ -466,12 +435,10 @@ def main():
         if trained_items == 0:
             print("[WARN] No training audio seen. Falling back to torchaudio likely failed - check internet or dataset availability.")
 
-        # save per-epoch checkpoint
         ep_path = f"models/asr_tiny_fp32_ep{epoch}.pt"
         torch.save(model.state_dict(), ep_path)
         print(f"? Saved {ep_path}")
 
-        # validate & keep best, also collect metrics
         val_cer, val_rmse, confusion = validate(model, n_samples=VALID_SAMPLES, collect_confusion=True)
         char_acc = 1.0 - val_cer
 
@@ -484,7 +451,6 @@ def main():
             f"RMSE(CER)={val_rmse:.3f}   (best CER so far: {best_cer:.3f})"
         )
 
-        # save confusion matrix for this epoch
         if confusion is not None:
             conf_path = f"models/confusion_matrix_epoch{epoch:02d}.npy"
             np.save(conf_path, confusion)
@@ -499,7 +465,6 @@ def main():
                     f.write(f"{rc}: {row_counts}\n")
             print(f"[val] Saved text confusion matrix to {txt_path}")
 
-        # track best model by CER
         if val_cer < best_cer:
             best_cer = val_cer
             best_char_acc = char_acc
@@ -507,12 +472,11 @@ def main():
             torch.save(model.state_dict(), best_path)
             print(f"? Saved new best: {best_path} (CER={best_cer:.3f}, char_acc={best_char_acc*100:.2f}%)")
 
-    # final save (last weights)
+
     torch.save(model.state_dict(), "models/asr_tiny_fp32.pt")
     print("Saved FP32 model to models/asr_tiny_fp32.pt")
     print(f"Best validation CER: {best_cer:.4f}  (char accuracy={best_char_acc*100:.2f}%)")
 
-    # ----- save metric histories -----
     metrics = {
         "train_loss": train_losses,
         "val_cer": val_cers,
@@ -524,10 +488,9 @@ def main():
         json.dump(metrics, f, indent=2)
     print(f"[metrics] Saved metric history to {metrics_path}")
 
-    # ----- plots -----
+
     epochs = list(range(1, len(train_losses) + 1))
 
-    # 1) Train loss
     plt.figure()
     plt.plot(epochs, train_losses, marker="o")
     plt.xlabel("Epoch")
@@ -540,7 +503,6 @@ def main():
     plt.close()
     print(f"[metrics] Saved train loss plot to {loss_plot_path}")
 
-    # 2) CER + char accuracy
     plt.figure()
     plt.plot(epochs, val_cers, marker="o", label="CER")
     plt.plot(epochs, val_char_accs, marker="x", label="Char accuracy")
@@ -555,7 +517,6 @@ def main():
     plt.close()
     print(f"[metrics] Saved CER/accuracy plot to {cer_plot_path}")
 
-    # 3) RMSE(CER)
     plt.figure()
     plt.plot(epochs, val_rmses, marker="o")
     plt.xlabel("Epoch")
@@ -571,3 +532,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
